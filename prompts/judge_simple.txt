@@ -1,0 +1,14 @@
+Compare two answers for factual accuracy.
+
+Evidence: {evidence_chunks}
+Question: {question}
+
+Answer A: {answer_a}
+Answer B: {answer_b}
+
+Output JSON only:
+```json
+{{"verdict": "A", "rationale": "A cites both supporting chunks correctly."}}
+```
+
+Verdict:

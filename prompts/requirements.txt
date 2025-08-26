@@ -1,0 +1,13 @@
+transformers>=4.36.0
+peft>=0.7.0
+bitsandbytes>=0.41.0
+torch>=2.0.0
+datasets
+accelerate
+scikit-learn>=1.0.0
+scipy>=1.7.0
+pyyaml>=6.0
+tqdm>=4.62.0
+numpy>=1.21.0
+pandas>=1.3.0
+matplotlib>=3.4.0

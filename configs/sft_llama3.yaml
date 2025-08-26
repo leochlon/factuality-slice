@@ -1,0 +1,38 @@
+# configs/sft_llama3.yaml
+model_name: meta-llama/Llama-3-8B
+output_dir: checkpoints/sft/llama3-8b
+trust_remote_code: false
+load_in_4bit: true           # QLoRA
+bf16: true
+attn_implementation: flash_attention_2
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # For most LLaMA-class models these exist; trainer filters missing ones at runtime
+  target_modules: ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+
+data:
+  train_path: data/processed/train.jsonl
+  val_path: data/processed/val.jsonl
+  template: default
+  max_samples:
+  max_val_samples:
+
+training:
+  max_seq_length: 2048
+  per_device_train_batch_size: 1
+  per_device_eval_batch_size: 1
+  gradient_accumulation_steps: 64   # effective BS ~=128 seqs
+  num_train_epochs: 2
+  learning_rate: 1.5e-5
+  weight_decay: 0.1
+  warmup_ratio: 0.03
+  logging_steps: 10
+  eval_steps: 1000
+  save_steps: 1000
+  save_total_limit: 2
+  lr_scheduler_type: cosine
+  packing: true
+  seed: 42

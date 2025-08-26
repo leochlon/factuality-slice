@@ -1,0 +1,40 @@
+# configs/rm.yaml
+# Reward Model Training Configuration
+
+# Base model (should match SFT base for best results)
+base_model: google/gemma-2-9b  # or meta-llama/Llama-3-8B
+output_dir: checkpoints/rm/gemma2-9b
+
+# Training parameters
+training:
+  learning_rate: 5.0e-6
+  batch_size: 4
+  eval_batch_size: 8
+  num_epochs: 3
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  gradient_accumulation_steps: 4  # Effective batch size = 64
+  max_seq_length: 1024
+  eval_steps: 100
+  save_steps: 200
+  logging_steps: 10
+  seed: 42
+
+# Model configuration
+model:
+  load_in_8bit: true  # Set true for memory efficiency
+  use_lora: false      # Full fine-tuning of reward head only
+
+# Anti-gaming weights (tune these based on validation)
+anti_gaming:
+  citation_penalty_weight: 0.2      # Invalid citation penalty
+  confidence_penalty_weight: 0.1    # Confidence mismatch penalty  
+  length_penalty_weight: 0.05       # Over-length penalty
+  overcitation_penalty_weight: 0.15 # Citing too many chunks
+  span_penalty_weight: 0.25          # Citations not overlapping support spans
+
+# Data paths (created by make_prefs.py)
+data:
+  train_path: prefs/preferences.jsonl
+  eval_path: prefs/preferences_eval.jsonl  # Optional, split from main
+  test_path: prefs/preferences_test.jsonl  # For final validation
