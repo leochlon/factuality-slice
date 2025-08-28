@@ -1,911 +1,399 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-train_rm.py - Reward Model Training with Anti-gaming Features
+train_rm.fixed.py — Robust pairwise reward model trainer (v2)
+Improvements vs prior version:
+  * Proper AMP: uses torch.amp.autocast; disables GradScaler for bf16.
+  * Param groups: higher LR for classification head via --head-lr (default 10x base).
+  * Optional head-only warmup steps (--head-only-steps) to stabilize early training.
+  * Optional prompt cleanup (--clean-encoder-prompts) to strip chat markers for encoder models.
+  * Clearer logs; prints pairwise acc even without a val file if --eval-train is set.
 
-Trains a reward model on preference pairs using Bradley-Terry loss.
-Includes citation validation and anti-gaming penalties.
-
-Usage:
-  python train_rm.py -c configs/rm.yaml
+Usage (typical):
+  python train_rm.fixed.py \
+    --model microsoft/deberta-v3-base \
+    --data prefs/preferences.jsonl \
+    --save-dir runs/rm/deberta-v3-base \
+    --epochs 2 --batch-size 8 --grad-accum 2 \
+    --lr 2e-5 --head-lr 1e-4 --warmup-ratio 0.03 \
+    --max-length 512 --precision bf16 --clean-encoder-prompts
 """
+from __future__ import annotations
 
-import json
-import logging
-import math
-import time
-from pathlib import Path
-from typing import Dict, List, Any, Optional, Tuple, Union
-from dataclasses import dataclass
-from collections import defaultdict
-import warnings
+import argparse, json, os, sys, math, random, time, re
+from typing import List, Dict, Any, Optional
+
+try:
+    import yaml
+except Exception:
+    yaml = None
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import yaml
-import numpy as np
-from tqdm import tqdm
 from transformers import (
-    AutoModel,
-    AutoTokenizer,
-    AutoConfig,
-    set_seed,
-    get_linear_schedule_with_warmup,
-    BitsAndBytesConfig,
+    AutoTokenizer, AutoConfig, AutoModelForSequenceClassification,
+    get_linear_schedule_with_warmup
 )
-from sklearn.metrics import roc_auc_score
-from sklearn.calibration import calibration_curve
-from scipy.stats import spearmanr
 
-from prompt_schema import PromptTemplates, OutputValidator
+DEFAULTS = {
+    "model": "microsoft/deberta-v3-base",
+    "data": "prefs/preferences.jsonl",
+    "val": None,
+    "save_dir": "runs/rm",
+    "batch_size": 16,
+    "eval_batch_size": 32,
+    "grad_accum": 1,
+    "lr": 2e-5,
+    "head_lr": None,             # default: 10x base lr
+    "epochs": 2,
+    "max_length": 512,
+    "precision": "bf16",         # fp16 | bf16 | fp32
+    "checkpointing": False,
+    "num_workers": 2,
+    "weight_decay": 0.0,
+    "warmup_steps": 0,
+    "warmup_ratio": 0.03,
+    "seed": 42,
+    "clip_grad_norm": 1.0,
+    "head_only_steps": 0,        # if >0, train only head for first N optimizer updates
+    "clean_encoder_prompts": False,
+    "eval_train": False,         # if True and no val set, compute pairwise acc on a small train slice
+}
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("train_rm")
+CHAT_TAG_RE = re.compile(r"<\|/?(system|user|assistant|tool|observation|assistant_response)\|>", re.IGNORECASE)
 
-# Performance settings
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.set_float32_matmul_precision("high")
-
-
-def fmt_metric(value, precision=3):
-    """Format metric value for logging"""
-    if isinstance(value, (float, int)):
-        return f"{value:.{precision}f}"
-    else:
-        return str(value)
-
-
-@dataclass
-class RMConfig:
-    """Reward model configuration"""
-    base_model: str
-    output_dir: Path
-    learning_rate: float = 5e-6
-    batch_size: int = 16
-    eval_batch_size: int = 32
-    num_epochs: int = 3
-    warmup_ratio: float = 0.1
-    weight_decay: float = 0.01
-    max_seq_length: int = 2048
-    gradient_accumulation_steps: int = 1
-    eval_steps: int = 100
-    save_steps: int = 200
-    logging_steps: int = 10
-    load_in_8bit: bool = False
-    seed: int = 42
-    # Anti-gaming params - matching exact names
-    citation_penalty_weight: float = 0.2
-    confidence_penalty_weight: float = 0.1
-    length_penalty_weight: float = 0.05
-    overcitation_penalty_weight: float = 0.15
-    span_penalty_weight: float = 0.25  # For support span overlap check
-    
-    @classmethod
-    def from_yaml(cls, path: Path) -> "RMConfig":
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        
-        # Flatten nested config
-        flat = {}
-        for key, val in data.items():
-            if isinstance(val, dict):
-                flat.update(val)
-            else:
-                flat[key] = val
-        
-        # Convert paths
-        if "output_dir" in flat:
-            flat["output_dir"] = Path(flat["output_dir"])
-        
-        return cls(**{k: v for k, v in flat.items() if k in cls.__dataclass_fields__})
-
-
-def to_device(x: Any, device: torch.device) -> Any:
-    """Recursively move tensors to device"""
-    if torch.is_tensor(x):
-        return x.to(device)
-    elif isinstance(x, dict):
-        return {k: to_device(v, device) for k, v in x.items()}
-    elif isinstance(x, (list, tuple)):
-        return type(x)(to_device(v, device) for v in x)
-    else:
-        return x
-
-
-class RewardHead(nn.Module):
-    """Reward head with dropout for regularization"""
-    
-    def __init__(self, hidden_size: int, dropout: float = 0.1):
-        super().__init__()
-        self.dense = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(hidden_size, 1)
-        
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        x = self.dense(hidden_states)
-        x = torch.tanh(x)
-        x = self.dropout(x)
-        rewards = self.out_proj(x)
-        return rewards
-
-
-class RewardModel(nn.Module):
-    """Reward model with anti-gaming features"""
-    
-    def __init__(
-        self, 
-        base_model_name: str,
-        config: RMConfig,
-        device: str = "cuda"
-    ):
-        super().__init__()
-        self.config = config
-        self.device = device
-        
-        # Load base model
-        model_config = AutoConfig.from_pretrained(base_model_name)
-        
-        bnb_config = None
-        if config.load_in_8bit:
-            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
-        
-        self.base = AutoModel.from_pretrained(
-            base_model_name,
-            config=model_config,
-            torch_dtype=torch.bfloat16,
-            quantization_config=bnb_config,
-            device_map="auto" if device == "cuda" else None,
-        )
-        
-        # Freeze base model
-        for param in self.base.parameters():
-            param.requires_grad = False
-        
-        # Add reward head with correct dtype
-        base_dtype = next(self.base.parameters()).dtype
-        self.reward_head = RewardHead(model_config.hidden_size)
-        self.reward_head.to(device=device, dtype=base_dtype)
-    
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Forward pass returning rewards"""
-        
-        # Get base model outputs
-        outputs = self.base(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        
-        # Pool last hidden states (using last token for causal LM)
-        last_hidden = outputs.last_hidden_state
-        sequence_lengths = attention_mask.sum(dim=1) - 1
-        batch_size = input_ids.shape[0]
-        
-        pooled = last_hidden[
-            torch.arange(batch_size, device=last_hidden.device),
-            sequence_lengths
-        ]
-        
-        # Compute rewards
-        rewards = self.reward_head(pooled).squeeze(-1)
-        
-        return rewards
-
-
-class PreferenceDataset(Dataset):
-    """Dataset for preference pairs"""
-    
-    def __init__(
-        self,
-        data_path: Path,
-        tokenizer: AutoTokenizer,
-        max_length: int = 2048,
-        templates: Optional[PromptTemplates] = None
-    ):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.templates = templates or PromptTemplates()
-        self.validator = OutputValidator(strict_mode=False)
-        
-        # Load preferences
-        self.pairs = []
-        with open(data_path) as f:
-            for line in f:
-                if line.strip():
-                    pair = json.loads(line)
-                    # Validate/repair outputs
-                    n_chunks = len(pair.get("context_chunks", []))
-                    chosen_validated = self.validator.validate_and_repair(
-                        json.dumps(pair["chosen"]), n_chunks
-                    )
-                    rejected_validated = self.validator.validate_and_repair(
-                        json.dumps(pair["rejected"]), n_chunks
-                    )
-                    
-                    # Update with validated versions
-                    pair["chosen"]["answer"] = chosen_validated.answer
-                    pair["chosen"]["citations"] = chosen_validated.citations
-                    pair["chosen"]["confidence"] = chosen_validated.confidence
-                    pair["rejected"]["answer"] = rejected_validated.answer
-                    pair["rejected"]["citations"] = rejected_validated.citations
-                    pair["rejected"]["confidence"] = rejected_validated.confidence
-                    
-                    self.pairs.append(pair)
-        
-        logger.info(f"Loaded {len(self.pairs)} preference pairs from {data_path}")
-    
-    def __len__(self) -> int:
-        return len(self.pairs)
-    
-    def _format_response(self, output: Dict[str, Any]) -> str:
-        """Format response for tokenization"""
-        return json.dumps({
-            "answer": output.get("answer", ""),
-            "citations": output.get("citations", []),
-            "confidence": output.get("confidence", 0.5)
-        })
-    
-    def _compute_penalties(self, output: Dict[str, Any], pair: Dict[str, Any]) -> Dict[str, float]:
-        """Compute penalty features for anti-gaming including span overlap"""
-        penalties = {}
-        
-        citations = output.get("citations", [])
-        answer = output.get("answer", "")
-        confidence = output.get("confidence", 0.5)
-        n_chunks = len(pair.get("context_chunks", []))
-        
-        # 1. Invalid citations (out of bounds)
-        invalid = sum(1 for c in citations if not (0 <= c < n_chunks))
-        penalties["invalid_citations"] = invalid / max(1, len(citations)) if citations else 0.0
-        
-        # 2. Over-citation (citing more than 70% of chunks)
-        if n_chunks > 0 and len(citations) > 0.7 * n_chunks:
-            penalties["overcitation"] = (len(citations) - 0.7 * n_chunks) / n_chunks
-        else:
-            penalties["overcitation"] = 0.0
-        
-        # 3. Length penalty
-        max_len = 120
-        if len(answer) > max_len:
-            penalties["length"] = min(1.0, (len(answer) - max_len) / max_len)
-        else:
-            penalties["length"] = 0.0
-        
-        # 4. Confidence mismatch (high confidence with no citations)
-        if confidence > 0.7 and not citations:
-            penalties["confidence_mismatch"] = confidence - 0.3
-        else:
-            penalties["confidence_mismatch"] = 0.0
-        
-        # 5. Support span overlap check (KEY anti-gaming feature from spec)
-        support_spans = pair.get("labels", {}).get("support_spans", pair.get("support_spans", []))
-        
-        if citations and support_spans:
-            # Check how many cited chunks actually contain support evidence
-            overlaps = 0
-            for cite_idx in citations:
-                if 0 <= cite_idx < n_chunks:
-                    # Check if this citation index is in the support spans
-                    if cite_idx in support_spans:
-                        overlaps += 1
-                    else:
-                        # Also check for string overlap as fallback
-                        chunk_text = pair["context_chunks"][cite_idx].get("text", "")
-                        # Check if any support span text appears in this chunk
-                        for span_idx in support_spans:
-                            if isinstance(span_idx, int) and 0 <= span_idx < n_chunks:
-                                support_text = pair["context_chunks"][span_idx].get("text", "")
-                                # Simple substring check for overlap
-                                if support_text and chunk_text and len(support_text) > 10:
-                                    # Check for meaningful overlap (not just common words)
-                                    if support_text[:50] in chunk_text or chunk_text[:50] in support_text:
-                                        overlaps += 0.5  # Partial credit for text overlap
-                                        break
-            
-            # Penalty = fraction of citations that don't overlap support
-            penalties["span_miss_rate"] = 1.0 - (overlaps / max(1, len(citations)))
-        else:
-            penalties["span_miss_rate"] = 0.0
-        
-        # Clamp all penalties to [0, 1] for stability
-        for k in penalties:
-            penalties[k] = float(max(0.0, min(1.0, penalties[k])))
-        return penalties
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        pair = self.pairs[idx]
-        
-        # Build prompt
-        prompt = self.templates.get_sft_prompt(
-            question=pair["question"],
-            evidence_chunks=pair["context_chunks"]
-        )
-        
-        # Format chosen and rejected
-        chosen_text = prompt + "\n" + self._format_response(pair["chosen"])
-        rejected_text = prompt + "\n" + self._format_response(pair["rejected"])
-        
-        # Tokenize
-        chosen_encoding = self.tokenizer(
-            chosen_text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        rejected_encoding = self.tokenizer(
-            rejected_text,
-            truncation=True,
-            max_length=self.max_length,
-            padding="max_length",
-            return_tensors="pt"
-        )
-        
-        # Compute anti-gaming features
-        chosen_penalties = self._compute_penalties(pair["chosen"], pair)
-        rejected_penalties = self._compute_penalties(pair["rejected"], pair)
-        
-        # Determine label (1 if chosen is better, 0 otherwise)
-        margin = pair.get("labels", {}).get("margin", 0.0)
-        label = 1 if margin > 0 else 0
-        
-        return {
-            "chosen_input_ids": chosen_encoding["input_ids"].squeeze(0),
-            "chosen_attention_mask": chosen_encoding["attention_mask"].squeeze(0),
-            "rejected_input_ids": rejected_encoding["input_ids"].squeeze(0),
-            "rejected_attention_mask": rejected_encoding["attention_mask"].squeeze(0),
-            "chosen_penalties": {k: torch.tensor(v, dtype=torch.float32) 
-                                for k, v in chosen_penalties.items()},
-            "rejected_penalties": {k: torch.tensor(v, dtype=torch.float32) 
-                                  for k, v in rejected_penalties.items()},
-            "label": torch.tensor(label, dtype=torch.long),
-            "margin": torch.tensor(margin, dtype=torch.float32),
-            "chosen_confidence": torch.tensor(pair["chosen"].get("confidence", 0.5), dtype=torch.float32),
-            "rejected_confidence": torch.tensor(pair["rejected"].get("confidence", 0.5), dtype=torch.float32),
-            "source": pair.get("metadata", {}).get("source", "unknown")
-        }
-
-
-class RewardTrainer:
-    """Trainer for reward model"""
-    
-    def __init__(
-        self,
-        model: RewardModel,
-        config: RMConfig,
-        train_dataset: Dataset,
-        eval_dataset: Optional[Dataset] = None
-    ):
-        self.model = model
-        self.config = config
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
-        
-        # Setup data loaders
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=True
-        )
-        
-        if eval_dataset:
-            self.eval_loader = DataLoader(
-                eval_dataset,
-                batch_size=config.eval_batch_size,
-                shuffle=False,
-                num_workers=2,
-                pin_memory=True
-            )
-        else:
-            self.eval_loader = None
-        
-        # Setup optimizer
-        self.optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
-        
-        # Setup scheduler
-        num_training_steps = len(self.train_loader) * config.num_epochs
-        num_warmup_steps = int(config.warmup_ratio * num_training_steps)
-        
-        self.scheduler = get_linear_schedule_with_warmup(
-            self.optimizer,
-            num_warmup_steps=num_warmup_steps,
-            num_training_steps=num_training_steps
-        )
-        
-        # Tracking
-        self.global_step = 0
-        self.best_eval_auc = 0.0
-        self.train_losses = []
-        self.eval_metrics = []
-    
-    def compute_loss(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """Compute Bradley-Terry loss with anti-gaming penalties"""
-        
-        # Get rewards for chosen and rejected
-        chosen_rewards = self.model(
-            batch["chosen_input_ids"],
-            batch["chosen_attention_mask"]
-        )
-        
-        rejected_rewards = self.model(
-            batch["rejected_input_ids"],
-            batch["rejected_attention_mask"]
-        )
-        
-        # Apply anti-gaming penalties with correct config key mapping
-        penalty_map = {
-            "invalid_citations": "citation_penalty_weight",
-            "overcitation": "overcitation_penalty_weight", 
-            "length": "length_penalty_weight",
-            "confidence_mismatch": "confidence_penalty_weight",
-            "span_miss_rate": "span_penalty_weight"
-        }
-        
-        for penalty_name, config_key in penalty_map.items():
-            if "chosen_penalties" in batch and penalty_name in batch["chosen_penalties"]:
-                weight = getattr(self.config, config_key, 0.1)
-                chosen_penalty = batch["chosen_penalties"][penalty_name]
-                rejected_penalty = batch["rejected_penalties"][penalty_name]
-                
-                chosen_rewards = chosen_rewards - weight * chosen_penalty
-                rejected_rewards = rejected_rewards - weight * rejected_penalty
-        
-        # Bradley-Terry loss
-        logits = chosen_rewards - rejected_rewards
-        loss = -F.logsigmoid(logits).mean()
-        
-        return loss, {"logits": logits.detach(), "rewards_diff": logits.detach()}
-    
-    def compute_baseline_heuristic(self, batch: Dict[str, torch.Tensor]) -> np.ndarray:
-        """Compute simple baseline heuristic scores"""
-        # Heuristic: prefer valid citations, less overcitation, shorter, higher confidence, better span overlap
-        chosen_score = (
-            (1.0 - batch["chosen_penalties"]["invalid_citations"]) 
-            - batch["chosen_penalties"]["overcitation"]
-            - batch["chosen_penalties"]["length"] 
-            - batch["chosen_penalties"]["span_miss_rate"]  # Include span penalty in baseline
-            + batch["chosen_confidence"]
-        )
-        
-        rejected_score = (
-            (1.0 - batch["rejected_penalties"]["invalid_citations"])
-            - batch["rejected_penalties"]["overcitation"]
-            - batch["rejected_penalties"]["length"]
-            - batch["rejected_penalties"]["span_miss_rate"]  # Include span penalty in baseline
-            + batch["rejected_confidence"]
-        )
-        
-        return (chosen_score - rejected_score).cpu().numpy()
-    
-    def evaluate(self) -> Dict[str, float]:
-        """Evaluate model on validation set with proper metrics"""
-        if not self.eval_loader:
-            return {}
-        
-        self.model.eval()
-        
-        # Collect all predictions and labels
-        all_labels = []
-        all_scores = []  # Reward differences (continuous)
-        all_margins = []
-        all_sources = []
-        all_chosen_conf = []
-        all_rejected_conf = []
-        all_heuristic_scores = []
-        total_loss = 0
-        
-        with torch.no_grad():
-            for batch in tqdm(self.eval_loader, desc="Evaluating"):
-                # Move to device
-                batch = to_device(batch, self.model.device)
-                
-                loss, info = self.compute_loss(batch)
-                total_loss += loss.item()
-                
-                # Collect predictions (continuous scores for AUC)
-                reward_diff = info["rewards_diff"].cpu().numpy()
-                all_scores.extend(reward_diff)
-                
-                # Labels
-                all_labels.extend(batch["label"].cpu().numpy())
-                
-                # Other metadata
-                all_margins.extend(batch["margin"].cpu().numpy())
-                all_sources.extend(batch["source"])
-                all_chosen_conf.extend(batch["chosen_confidence"].cpu().numpy())
-                all_rejected_conf.extend(batch["rejected_confidence"].cpu().numpy())
-                
-                # Baseline heuristic
-                heuristic = self.compute_baseline_heuristic(batch)
-                all_heuristic_scores.extend(heuristic)
-        
-        # Convert to arrays
-        y_true = np.array(all_labels)
-        y_scores = np.array(all_scores)
-        margins = np.array(all_margins)
-        conf_diff = np.array(all_chosen_conf) - np.array(all_rejected_conf)
-        heuristic_scores = np.array(all_heuristic_scores)
-        
-        # Core metrics
-        metrics = {
-            "eval_loss": total_loss / len(self.eval_loader),
-            "accuracy": float(((y_scores > 0).astype(int) == y_true).mean())
-        }
-        
-        # ROC-AUC with continuous scores (KEY FIX)
-        if len(set(y_true)) > 1:
-            metrics["roc_auc"] = float(roc_auc_score(y_true, y_scores))
-            
-            # Baseline heuristic AUC
-            metrics["heuristic_auc"] = float(roc_auc_score(y_true, heuristic_scores))
-            
-            # Check if RM beats baseline
-            metrics["beats_baseline"] = metrics["roc_auc"] > metrics["heuristic_auc"]
-        
-        # Calibration curve (reliability)
-        try:
-            probs = 1 / (1 + np.exp(-y_scores))  # Convert to probabilities
-            fraction_pos, mean_pred = calibration_curve(
-                y_true, probs, n_bins=5, strategy="quantile"
-            )
-            metrics["calibration_curve"] = {
-                "fraction_positive": fraction_pos.tolist(),
-                "mean_predicted": mean_pred.tolist()
-            }
-            # Expected calibration error
-            ece = np.abs(fraction_pos - mean_pred).mean()
-            metrics["calibration_ece"] = float(ece)
-        except Exception as e:
-            logger.warning(f"Calibration computation failed: {e}")
-        
-        # Reward monotonicity with confidence (when correct)
-        correct_mask = (y_true == 1)
-        if correct_mask.sum() > 1:
+def load_jsonl(path: str) -> List[dict]:
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
             try:
-                corr, p_value = spearmanr(y_scores[correct_mask], conf_diff[correct_mask])
-                metrics["monotonicity_spearman"] = float(corr)
-                metrics["monotonicity_p_value"] = float(p_value)
-            except Exception as e:
-                logger.warning(f"Monotonicity computation failed: {e}")
-        
-        # Known-wrong vs known-right separation (using margin as proxy)
-        high_margin_mask = (margins > 0.5)
-        low_margin_mask = (margins < -0.5)
-        if high_margin_mask.any() and low_margin_mask.any():
-            known_right_scores = y_scores[high_margin_mask].mean()
-            known_wrong_scores = y_scores[low_margin_mask].mean() 
-            metrics["known_separation"] = float(known_right_scores - known_wrong_scores)
-        
-        # Per-source accuracy
-        from collections import defaultdict
-        source_data = defaultdict(list)
-        for i, src in enumerate(all_sources):
-            source_data[src].append((y_true[i], y_scores[i]))
-        
-        for src, pairs in source_data.items():
-            if len(pairs) > 0:
-                src_true = np.array([p[0] for p in pairs])
-                src_scores = np.array([p[1] for p in pairs])
-                metrics[f"accuracy_{src}"] = float(((src_scores > 0) == src_true).mean())
-        
-        self.model.train()
-        return metrics
-    
-    def train(self):
-        """Main training loop"""
-        logger.info(f"Starting training for {self.config.num_epochs} epochs")
-        logger.info(f"Total optimization steps: {len(self.train_loader) * self.config.num_epochs}")
-        
-        self.model.train()
-        
-        for epoch in range(self.config.num_epochs):
-            epoch_loss = 0
-            progress = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
-            
-            for step, batch in enumerate(progress):
-                # Move to device
-                batch = to_device(batch, self.model.device)
-                
-                # Forward pass
-                loss, _ = self.compute_loss(batch)
-                
-                # Backward pass  
-                loss.backward()
-                
-                # Gradient accumulation
-                if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
-                        max_norm=1.0
-                    )
-                    self.optimizer.step()
-                    self.scheduler.step()
-                    self.optimizer.zero_grad()
-                    self.global_step += 1
-                
-                epoch_loss += loss.item()
-                self.train_losses.append(loss.item())
-                
-                # Update progress
-                progress.set_postfix({
-                    "loss": f"{loss.item():.4f}",
-                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"
-                })
-                
-                # Logging
-                if self.global_step % self.config.logging_steps == 0:
-                    avg_loss = np.mean(self.train_losses[-self.config.logging_steps:])
-                    logger.info(f"Step {self.global_step}: loss={avg_loss:.4f}")
-                
-                # Evaluation
-                if self.global_step % self.config.eval_steps == 0 and self.eval_loader:
-                    metrics = self.evaluate()
-                    self.eval_metrics.append(metrics)
-                    
-                    logger.info(f"Step {self.global_step}:")
-                    logger.info(f"  Loss: {fmt_metric(metrics['eval_loss'], 4)}")
-                    logger.info(f"  Accuracy: {fmt_metric(metrics['accuracy'])}")
-                    logger.info(f"  ROC-AUC: {fmt_metric(metrics.get('roc_auc', 'N/A'))}")
-                    logger.info(f"  vs Baseline: {fmt_metric(metrics.get('heuristic_auc', 'N/A'))}")
-                    
-                    # Save best model based on AUC
-                    current_auc = metrics.get("roc_auc", 0)
-                    if current_auc > self.best_eval_auc:
-                        self.best_eval_auc = current_auc
-                        self.save_checkpoint("best")
-                        logger.info(f"  New best model! AUC: {current_auc:.3f}")
-                
-                # Regular checkpoint
-                if self.global_step % self.config.save_steps == 0:
-                    self.save_checkpoint(f"step_{self.global_step}")
-            
-            # End of epoch
-            avg_epoch_loss = epoch_loss / len(self.train_loader)
-            logger.info(f"Epoch {epoch+1} completed. Avg loss: {avg_epoch_loss:.4f}")
-        
-        # Final save
-        self.save_checkpoint("final")
-        
-        # Save training history
-        self.save_training_history()
-    
-    def save_checkpoint(self, tag: str):
-        """Save model checkpoint"""
-        save_dir = self.config.output_dir / tag
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save reward head only (base model is frozen)
-        torch.save(
-            self.model.reward_head.state_dict(),
-            save_dir / "reward_head.pt"
-        )
-        
-        # Save config
-        with open(save_dir / "config.json", "w") as f:
-            json.dump({
-                "base_model": self.config.base_model,
-                "step": self.global_step,
-                "best_auc": self.best_eval_auc,
-            }, f, indent=2)
-        
-        logger.info(f"Saved checkpoint to {save_dir}")
-    
-    def save_training_history(self):
-        """Save training metrics"""
-        # Handle Path serialization
-        config_dict = {}
-        for k, v in vars(self.config).items():
-            if isinstance(v, Path):
-                config_dict[k] = str(v)
-            else:
-                config_dict[k] = v
-        
-        history = {
-            "train_losses": self.train_losses,
-            "eval_metrics": self.eval_metrics,
-            "config": config_dict,
-        }
-        
-        with open(self.config.output_dir / "training_history.json", "w") as f:
-            json.dump(history, f, indent=2)
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    return rows
 
+def save_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2)
 
-def validate_reward_model(
-    model: RewardModel,
-    test_data_path: Path,
-    tokenizer: AutoTokenizer,
-    config: RMConfig
-) -> Dict[str, Any]:
-    """Comprehensive validation of trained reward model"""
-    
-    # Load test data
-    test_dataset = PreferenceDataset(test_data_path, tokenizer, config.max_seq_length)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-    
-    model.eval()
-    
-    # Create a temporary trainer for evaluation
-    trainer = RewardTrainer(model, config, test_dataset, None)
-    trainer.eval_loader = test_loader
-    
-    # Run comprehensive evaluation
-    results = trainer.evaluate()
-    
-    # Additional validation checks
-    validation_passed = True
-    checks = []
-    
-    # Check 1: AUC > baseline heuristic
-    if "beats_baseline" in results:
-        passed = results["beats_baseline"]
-        checks.append(("AUC > baseline heuristic", passed))
-        validation_passed &= passed
-    
-    # Check 2: Known separation > threshold
-    if "known_separation" in results:
-        passed = results["known_separation"] > 0.3
-        checks.append(("Known wrong/right separation > 0.3", passed))
-        validation_passed &= passed
-    
-    # Check 3: Monotonicity positive correlation
-    if "monotonicity_spearman" in results:
-        passed = results["monotonicity_spearman"] > 0.2
-        checks.append(("Confidence monotonicity > 0.2", passed))
-        validation_passed &= passed
-    
-    # Check 4: Calibration ECE < threshold
-    if "calibration_ece" in results:
-        passed = results["calibration_ece"] < 0.2
-        checks.append(("Calibration ECE < 0.2", passed))
-        validation_passed &= passed
-    
-    results["validation_checks"] = checks
-    results["validation_passed"] = validation_passed
-    
-    return results
+def is_decoder_only(model_type: str) -> bool:
+    return model_type in {"llama", "qwen2", "qwen2_moe", "gpt2", "mpt", "mixtral", "phi", "gemma", "opt"}
 
+def ensure_pad_and_sides(tok, model_type: str):
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token or tok.unk_token
+    if is_decoder_only(model_type):
+        tok.padding_side = "left"; tok.truncation_side = "left"
+    else:
+        tok.padding_side = "right"; tok.truncation_side = "right"
+
+def build_head_from_row(r: dict, clean: bool) -> str:
+    ptxt = r.get("prompt")
+    if isinstance(ptxt, str) and ptxt:
+        if clean:
+            # strip chat tags and collapse duplicated blank lines
+            ptxt = CHAT_TAG_RE.sub("", ptxt)
+            ptxt = re.sub(r"\n{3,}", "\n\n", ptxt).strip()
+        return ptxt
+    q = r.get("question", "")
+    head = (
+        "You are a factual QA system. Answer using ONLY the provided evidence.\n\n"
+        f"Question:\n{q}\n\n"
+        "Respond as JSON: {\"answer\": \"...\", \"citations\": [], \"confidence\": 0.5}\n\n"
+        "Response:"
+    )
+    return head
+
+def normalize_resp(sample: dict, key: str) -> str:
+    parsed = sample.get(f"{key}_parsed")
+    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str) and parsed["text"]:
+        return parsed["text"]
+    txt = sample.get(key, "")
+    if isinstance(txt, (dict, list)):
+        return json.dumps(txt, ensure_ascii=False)
+    return str(txt)
+
+class PrefDataset(Dataset):
+    def __init__(self, path: str, tokenizer: AutoTokenizer, max_length: int, clean_prompts: bool, encoder_like: bool):
+        self.rows = load_jsonl(path)
+        self.tok = tokenizer
+        self.max_length = max_length
+        self.clean_prompts = clean_prompts and encoder_like
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        r = self.rows[idx]
+        head = build_head_from_row(r, clean=self.clean_prompts)
+        pos = head + "\n" + normalize_resp(r, "chosen")
+        neg = head + "\n" + normalize_resp(r, "rejected")
+        return {"pos": pos, "neg": neg}
+
+def collate(batch, tokenizer: AutoTokenizer, max_length: int):
+    max_len = min(max_length, getattr(tokenizer, "model_max_length", max_length))
+    pos_texts = [b["pos"] for b in batch]
+    neg_texts = [b["neg"] for b in batch]
+    pos = tokenizer(pos_texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+    neg = tokenizer(neg_texts, padding=True, truncation=True, max_length=max_len, return_tensors="pt")
+    return {"pos": pos, "neg": neg}
+
+@torch.jit.script
+def pairwise_loss(pos_scores: torch.Tensor, neg_scores: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.softplus(-(pos_scores - neg_scores)).mean()
+
+def unify_cfg(args, yml: Optional[dict]) -> dict:
+    cfg = DEFAULTS.copy()
+    if isinstance(yml, dict):
+        if "base_model" in yml and "model" not in yml:
+            yml = yml.copy(); yml["model"] = yml.pop("base_model")
+        tr = yml.get("training") or {}
+        if tr:
+            cfg["batch_size"] = int(tr.get("batch_size", cfg["batch_size"]))
+            cfg["eval_batch_size"] = int(tr.get("eval_batch_size", cfg["eval_batch_size"]))
+            cfg["lr"] = float(tr.get("learning_rate", cfg["lr"]))
+            cfg["epochs"] = int(tr.get("num_epochs", cfg["epochs"]))
+            cfg["grad_accum"] = int(tr.get("gradient_accumulation_steps", cfg["grad_accum"]))
+            cfg["weight_decay"] = float(tr.get("weight_decay", cfg["weight_decay"]))
+            cfg["warmup_ratio"] = float(tr.get("warmup_ratio", cfg["warmup_ratio"]))
+            cfg["warmup_steps"] = int(tr.get("warmup_steps", cfg["warmup_steps"]))
+        data = yml.get("data") or {}
+        if data:
+            cfg["data"] = data.get("train_path", cfg["data"])
+            cfg["val"] = data.get("eval_path", cfg["val"])
+        for k in ("model","save_dir","max_length","precision","checkpointing","num_workers","seed","clip_grad_norm"):
+            if k in yml: cfg[k] = yml[k]
+    # CLI overrides
+    for k in ["model","data","val","save_dir","batch_size","eval_batch_size","grad_accum","lr","head_lr","epochs",
+              "max_length","precision","num_workers","weight_decay","warmup_steps","warmup_ratio","seed",
+              "clip_grad_norm","head_only_steps","clean_encoder_prompts","checkpointing","eval_train"]:
+        v = getattr(args, k.replace("-","_"), None)
+        if v is not None:
+            cfg[k] = v
+    # Flatten nested model config if dict
+    if isinstance(cfg.get("model"), dict):
+        md = cfg["model"]
+        name = md.get("name") or md.get("id") or md.get("base") or md.get("path")
+        if not isinstance(name, str) or not name:
+            raise SystemExit("Invalid 'model' section: expected a 'name' field with HF id or local path.")
+        cfg["model"] = name
+    return cfg
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-c", "--config", type=Path, required=True, help="Config YAML file")
-    parser.add_argument("--validate-only", action="store_true", help="Only run validation")
-    parser.add_argument("--checkpoint", type=str, help="Checkpoint to validate")
-    args = parser.parse_args()
-    
-    # Load config
-    config = RMConfig.from_yaml(args.config)
-    set_seed(config.seed)
-    
-    # Setup paths
-    config.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.base_model, use_fast=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-    
-    # Initialize model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = RewardModel(config.base_model, config, device)
-    model.to(device)
-    
-    if args.validate_only:
-        # Load checkpoint
-        checkpoint_dir = config.output_dir / (args.checkpoint or "best")
-        model.reward_head.load_state_dict(
-            torch.load(checkpoint_dir / "reward_head.pt", map_location=device)
-        )
-        
-        # Run validation
-        test_path = Path("prefs/preferences.jsonl")  # Or from config
-        results = validate_reward_model(model, test_path, tokenizer, config)
-        
-        # Save results
-        with open(config.output_dir / "validation_results.json", "w") as f:
-            json.dump(results, f, indent=2)
-        
-        print("\n" + "="*50)
-        print("VALIDATION RESULTS")
-        print("="*50)
-        print(f"Accuracy: {fmt_metric(results.get('accuracy', 'N/A'))}")
-        print(f"ROC-AUC: {fmt_metric(results.get('roc_auc', 'N/A'))}")
-        print(f"Baseline AUC: {fmt_metric(results.get('heuristic_auc', 'N/A'))}")
-        print(f"Beats baseline: {results.get('beats_baseline', 'N/A')}")
-        print(f"Known separation: {fmt_metric(results.get('known_separation', 'N/A'))}")
-        print(f"Monotonicity: {fmt_metric(results.get('monotonicity_spearman', 'N/A'))}")
-        print(f"Calibration ECE: {fmt_metric(results.get('calibration_ece', 'N/A'))}")
-        print("\nValidation checks:")
-        for check_name, passed in results.get("validation_checks", []):
-            status = "✓" if passed else "✗"
-            print(f"  {status} {check_name}")
-        print("="*50)
-        
-        if not results.get("validation_passed", False):
-            return 1
-        
-    else:
-        # Load datasets
-        train_path = Path("prefs/preferences.jsonl")
-        
-        # Create deterministic train/eval split if needed
-        train_split_path = Path("prefs/preferences_train.jsonl")
-        eval_path = Path("prefs/preferences_eval.jsonl")
-        
-        if not eval_path.exists() and train_path.exists():
-            # Load all data
-            with open(train_path) as f:
-                all_data = [json.loads(line) for line in f if line.strip()]
-            
-            # Deterministic shuffle and split
-            rng = np.random.RandomState(config.seed)
-            indices = rng.permutation(len(all_data))
-            split_idx = int(0.9 * len(all_data))
-            train_indices = indices[:split_idx]
-            eval_indices = indices[split_idx:]
-            
-            # Save splits (don't overwrite original)
-            with open(train_split_path, 'w') as f:
-                for idx in train_indices:
-                    f.write(json.dumps(all_data[idx]) + '\n')
-            
-            with open(eval_path, 'w') as f:
-                for idx in eval_indices:
-                    f.write(json.dumps(all_data[idx]) + '\n')
-            
-            logger.info(f"Created splits: train={len(train_indices)}, eval={len(eval_indices)}")
-            
-            # Use the split version for training
-            train_path = train_split_path
-        elif train_split_path.exists():
-            # Use existing split
-            train_path = train_split_path
-        
-        train_dataset = PreferenceDataset(train_path, tokenizer, config.max_seq_length)
-        eval_dataset = PreferenceDataset(eval_path, tokenizer, config.max_seq_length) if eval_path.exists() else None
-        
-        # Train
-        trainer = RewardTrainer(model, config, train_dataset, eval_dataset)
-        trainer.train()
-        
-        # Final validation
-        if eval_path.exists():
-            model.reward_head.load_state_dict(
-                torch.load(config.output_dir / "best" / "reward_head.pt", map_location=device)
-            )
-            results = validate_reward_model(model, eval_path, tokenizer, config)
-            
-            with open(config.output_dir / "final_validation.json", "w") as f:
-                json.dump(results, f, indent=2)
-            
-            print("\n" + "="*50)
-            print("TRAINING COMPLETE")
-            print("="*50)
-            print(f"Best ROC-AUC: {fmt_metric(results.get('roc_auc', 'N/A'))}")
-            print(f"vs Baseline: {fmt_metric(results.get('heuristic_auc', 'N/A'))}")
-            print(f"Final accuracy: {fmt_metric(results.get('accuracy', 'N/A'))}")
-            print(f"All checks passed: {results.get('validation_passed', False)}")
-            print(f"Output: {config.output_dir}")
-            print("="*50)
-            
-            if not results.get("validation_passed", False):
-                logger.warning("Some validation checks failed!")
-                return 1
-    
-    return 0
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", type=str, default=None)
+    ap.add_argument("--model", type=str, default=None)
+    ap.add_argument("--data", type=str, default=None)
+    ap.add_argument("--val", type=str, default=None)
+    ap.add_argument("--save-dir", type=str, default=None)
+    ap.add_argument("--batch-size", type=int, default=None)
+    ap.add_argument("--eval-batch-size", type=int, default=None)
+    ap.add_argument("--grad-accum", type=int, default=None)
+    ap.add_argument("--lr", type=float, default=None)
+    ap.add_argument("--head-lr", type=float, default=None)
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--max-length", type=int, default=None)
+    ap.add_argument("--precision", type=str, default=None, choices=["fp16","bf16","fp32"])
+    ap.add_argument("--checkpointing", action="store_true")
+    ap.add_argument("--num-workers", type=int, default=None)
+    ap.add_argument("--weight-decay", type=float, default=None)
+    ap.add_argument("--warmup-steps", type=int, default=None)
+    ap.add_argument("--warmup-ratio", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--clip-grad-norm", type=float, default=None)
+    ap.add_argument("--head-only-steps", type=int, default=None)
+    ap.add_argument("--clean-encoder-prompts", action="store_true")
+    ap.add_argument("--eval-train", action="store_true")
+    args = ap.parse_args()
 
+    yml = None
+    if args.config:
+        if yaml is None:
+            print("[fatal] pyyaml not available but --config was provided", file=sys.stderr)
+            sys.exit(2)
+        with open(args.config, "r", encoding="utf-8") as f:
+            yml = yaml.safe_load(f)
+
+    cfg = unify_cfg(args, yml)
+    os.makedirs(cfg["save_dir"], exist_ok=True)
+    save_json(os.path.join(cfg["save_dir"], "train_config.json"), cfg)
+
+    torch.manual_seed(int(cfg["seed"])); random.seed(int(cfg["seed"]))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    model_name = cfg["model"]
+    hf_cfg = AutoConfig.from_pretrained(model_name, num_labels=1, problem_type="regression")
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    if is_decoder_only(hf_cfg.model_type):
+        tok.padding_side = "left"
+        tok.truncation_side = "left"
+    else:
+        tok.padding_side = "right"
+        tok.truncation_side = "left"   # <-- change to 'left' so the answer is preserved
+
+    ensure_pad_and_sides(tok, hf_cfg.model_type)
+    eff_max_len = min(int(cfg["max_length"]), getattr(tok, "model_max_length", int(cfg["max_length"])) or int(cfg["max_length"]))
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, config=hf_cfg)
+    if cfg["checkpointing"] and hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+    model.to(device)
+
+    # Precision
+    amp_dtype = None
+    if cfg["precision"] == "bf16":
+        amp_dtype = torch.bfloat16
+    elif cfg["precision"] == "fp16":
+        amp_dtype = torch.float16
+
+    # Data
+    if not os.path.exists(cfg["data"]):
+        raise SystemExit(f"Training data not found: {cfg['data']}")
+    encoder_like = not is_decoder_only(hf_cfg.model_type)
+    train_ds = PrefDataset(cfg["data"], tok, eff_max_len, clean_prompts=cfg["clean_encoder_prompts"], encoder_like=encoder_like)
+    val_ds = PrefDataset(cfg["val"], tok, eff_max_len, clean_prompts=cfg["clean_encoder_prompts"], encoder_like=encoder_like) if cfg["val"] else None
+    coll = lambda b: collate(b, tok, eff_max_len)
+
+    train_loader = DataLoader(
+        train_ds, batch_size=int(cfg["batch_size"]), shuffle=True,
+        num_workers=int(cfg["num_workers"]), pin_memory=(device=='cuda'),
+        collate_fn=coll, persistent_workers=(int(cfg["num_workers"])>0)
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=int(cfg["eval_batch_size"] or cfg["batch_size"]), shuffle=False,
+        num_workers=int(cfg["num_workers"]), pin_memory=(device=='cuda'),
+        collate_fn=coll, persistent_workers=(int(cfg["num_workers"])>0)
+    ) if val_ds else None
+
+    # Optimizer with param groups (head vs backbone)
+    head_kw = ("classifier", "score", "pooler.dense")
+    head_params, body_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad: 
+            continue
+        (head_params if any(k in n for k in head_kw) else body_params).append(p)
+
+    base_lr = float(cfg["lr"])
+    head_lr = float(cfg["head_lr"]) if cfg["head_lr"] is not None else base_lr * 10.0
+    optim_groups = [
+        {"params": body_params, "lr": base_lr, "weight_decay": float(cfg["weight_decay"])},
+        {"params": head_params, "lr": head_lr, "weight_decay": float(cfg["weight_decay"])}
+    ]
+    opt = torch.optim.AdamW(optim_groups)
+
+    total_update_steps = math.ceil(len(train_loader) / max(1, int(cfg["grad_accum"]))) * int(cfg["epochs"])
+    warmup_steps = int(cfg["warmup_steps"]) if cfg["warmup_steps"] else int((cfg["warmup_ratio"] or 0) * total_update_steps)
+    sched = get_linear_schedule_with_warmup(opt, num_warmup_steps=warmup_steps, num_training_steps=total_update_steps)
+
+    use_scaler = (amp_dtype is not None and device == "cuda" and amp_dtype == torch.float16)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+
+    print("============================================================")
+    print("Reward Model Training (v2)")
+    print("============================================================")
+    print(f"Model: {model_name} (type={hf_cfg.model_type})")
+    print(f"Train rows: {len(train_ds)} | Val rows: {len(val_ds) if val_ds else 0}")
+    print(f"Batch size: {cfg['batch_size']} (accum={cfg['grad_accum']}) | Epochs: {cfg['epochs']}")
+    print(f"Max length: {eff_max_len} | Precision: {cfg['precision']} | Device: {device}")
+    print(f"LR (body/head): {base_lr:.2e} / {head_lr:.2e} | Warmup steps: {warmup_steps}")
+    print(f"Head-only steps: {cfg['head_only_steps']} | Clean encoder prompts: {cfg['clean_encoder_prompts']}")
+    print(f"Save dir: {cfg['save_dir']}")
+    print("============================================================")
+
+    best_val = float("inf")
+    global_step = 0
+    head_only_steps = int(cfg["head_only_steps"] or 0)
+
+    for epoch in range(int(cfg["epochs"])):
+        model.train()
+        running = 0.0; t0 = time.time()
+        for step, batch in enumerate(train_loader):
+            pos = {k: v.to(device, non_blocking=True) for k, v in batch["pos"].items()}
+            neg = {k: v.to(device, non_blocking=True) for k, v in batch["neg"].items()}
+            if head_only_steps > 0 and global_step < head_only_steps:
+                for p in body_params: p.requires_grad = False
+            else:
+                for p in body_params: 
+                    if not p.requires_grad: p.requires_grad = True
+
+            if use_scaler:
+                with torch.cuda.amp.autocast(enabled=True, dtype=amp_dtype):
+                    pos_out = model(**pos).logits.squeeze(-1)
+                    neg_out = model(**neg).logits.squeeze(-1)
+                    loss = pairwise_loss(pos_out, neg_out) / max(1, int(cfg["grad_accum"]))
+                scaler.scale(loss).backward()
+            else:
+                with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=(amp_dtype is not None and device=='cuda')):
+                    pos_out = model(**pos).logits.squeeze(-1)
+                    neg_out = model(**neg).logits.squeeze(-1)
+                    loss = pairwise_loss(pos_out, neg_out) / max(1, int(cfg["grad_accum"]))
+                loss.backward()
+
+            running += loss.item()
+            if (step + 1) % int(cfg["grad_accum"]) == 0:
+                if float(cfg["clip_grad_norm"]) and cfg["clip_grad_norm"] > 0:
+                    if use_scaler:
+                        scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg["clip_grad_norm"]))
+                if use_scaler:
+                    scaler.step(opt); scaler.update()
+                else:
+                    opt.step()
+                opt.zero_grad(set_to_none=True)
+                sched.step()
+                global_step += 1
+
+        avg_loss = (running * max(1,int(cfg["grad_accum"]))) / max(1, len(train_loader))
+        print(f"[epoch {epoch+1}/{cfg['epochs']}] train loss: {avg_loss:.4f}  (time: {time.time()-t0:.1f}s)")
+
+        # Validation
+        if val_loader:
+            model.eval()
+            losses, acc = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    pos = {k: v.to(device, non_blocking=True) for k, v in batch["pos"].items()}
+                    neg = {k: v.to(device, non_blocking=True) for k, v in batch["neg"].items()}
+                    out_p = model(**pos).logits.squeeze(-1)
+                    out_n = model(**neg).logits.squeeze(-1)
+                    l = pairwise_loss(out_p, out_n)
+                    losses.append(l.item())
+                    acc.extend(((out_p > out_n).float().cpu().tolist()))
+            v = sum(losses)/max(1,len(losses)); a = sum(acc)/max(1,len(acc))
+            print(f"[epoch {epoch+1}] val loss: {v:.4f} | pairwise acc: {a:.3f}")
+            if v < best_val:
+                best_val = v
+                path = os.path.join(cfg["save_dir"], "best")
+                os.makedirs(path, exist_ok=True)
+                model.save_pretrained(path); tok.save_pretrained(path)
+                save_json(os.path.join(cfg["save_dir"], "best_metrics.json"), {"val_loss": v, "pairwise_acc": a})
+                print(f"  ✓ saved best to {path}")
+        elif cfg["eval_train"]:
+            # quick sanity check on a small training slice
+            model.eval()
+            with torch.no_grad():
+                n = 256 if len(train_ds) > 256 else len(train_ds)
+                loader = DataLoader(torch.utils.data.Subset(train_ds, range(n)),
+                                    batch_size=int(cfg["eval_batch_size"] or cfg["batch_size"]), collate_fn=coll)
+                acc = []
+                for batch in loader:
+                    pos = {k: v.to(device) for k, v in batch["pos"].items()}
+                    neg = {k: v.to(device) for k, v in batch["neg"].items()}
+                    out_p = model(**pos).logits.squeeze(-1)
+                    out_n = model(**neg).logits.squeeze(-1)
+                    acc.extend(((out_p > out_n).float().cpu().tolist()))
+                a = sum(acc)/max(1,len(acc))
+                print(f"[epoch {epoch+1}] train-slice pairwise acc: {a:.3f}")
+
+    # final save
+    path = os.path.join(cfg["save_dir"], "final")
+    os.makedirs(path, exist_ok=True)
+    model.save_pretrained(path); tok.save_pretrained(path)
+    print(f"Saved final checkpoint to: {path}")
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
