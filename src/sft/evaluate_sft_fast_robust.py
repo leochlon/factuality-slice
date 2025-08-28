@@ -17,7 +17,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
-from prompt_schema import PromptTemplates, OutputValidator
+from sft.prompt_schema import PromptTemplates, OutputValidator
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("eval_sft")

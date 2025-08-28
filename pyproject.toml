@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sft"
+version = "0.1.0"
+description = "Evidence-grounded SFT tooling (data, training, eval, prefs, ablations)"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "SFT", email = "noreply@example.com" }]
+dependencies = [
+  "transformers>=4.36.0",
+  "peft>=0.7.0",
+  "bitsandbytes>=0.41.0",
+  "torch>=2.0.0",
+  "datasets",
+  "accelerate",
+  "scikit-learn>=1.0.0",
+  "scipy>=1.7.0",
+  "pyyaml>=6.0",
+  "tqdm>=4.62.0",
+  "numpy>=1.21.0",
+  "pandas>=1.3.0",
+  "matplotlib>=3.4.0",
+]
+
+[project.scripts]
+"sft-build-data" = "sft.build_data:main"
+"sft-train-sft" = "sft.train_sft:main"
+"sft-train-rm" = "sft.train_rm:main"
+"sft-eval" = "sft.evaluate_sft_fast_robust:main"
+"sft-make-prefs" = "sft.make_prefs:main"
+"sft-ablate" = "sft.run_ablation_suite:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sft*"]
+exclude = []
+

@@ -30,7 +30,7 @@ from transformers import (
 )
 
 # Local
-from prompt_schema import PromptTemplates
+from sft.prompt_schema import PromptTemplates
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("train_sft")

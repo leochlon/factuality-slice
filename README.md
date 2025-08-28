@@ -22,54 +22,46 @@ The pipeline builds a unified dataset from multiple public QA sources:
 | NQ-Open | CC-BY 4.0 | Open-domain QA |
 | PopQA | MIT | Long-tail entity questions |
 
-## Requirements
+## Install
+
+Recommended: install in editable mode so `sft` commands and module imports work everywhere.
+
+```bash
+cd SFT
+pip install -e .
+```
+
+Alternatively, you can install dependencies directly:
 
 ```bash
 pip install -r requirements.txt
 ```
-
-Required packages:
-- `transformers>=4.36.0`
-- `peft>=0.7.0`
-- `bitsandbytes>=0.41.0`
-- `torch>=2.0.0`
-- `datasets`
-- `accelerate`
-- `scikit-learn`
-- `scipy`
-- `pyyaml`
-- `tqdm`
 
 ## Quick Start
 
 ### Step 1: Build the Dataset
 
 ```bash
-python build_data.py --data-dir data --seed 42 --accept-new-hash
+# either entrypoint or module form
+sft-build-data --data-dir data --seed 42 --accept-new-hash
+# python -m sft.build_data --data-dir data --seed 42 --accept-new-hash
 ```
 
 This downloads and processes data from FEVER, HotpotQA, NQ-Open, and PopQA, creating train/val/test splits with evidence chunks and citations.
 
-### Step 2: Generate Prompt Templates
+### Step 2: Supervised Fine-Tuning (SFT)
 
 ```bash
-python prompt_schema.py save --prompts-dir prompts
-```
-
-Creates standardized prompt templates and output schemas for training.
-
-### Step 3: Supervised Fine-Tuning (SFT)
-
-```bash
-python train_sft.py -c configs/sft_gemma2.yaml
+sft-train-sft -c configs/sft_gemma2.yaml
+# python -m sft.train_sft -c configs/sft_gemma2.yaml
 ```
 
 Fine-tunes a base model using LoRA/QLoRA on the evidence-grounded QA task.
 
-### Step 4: Evaluate SFT Model
+### Step 3: Evaluate SFT Model
 
 ```bash
-python evaluate_sft_fast_robust.py \
+sft-eval \
   --model-path checkpoints/sft/gemma2-9b/checkpoint-final \
   --base-model google/gemma-2-9b \
   --test-data data/processed/test.jsonl \
@@ -79,12 +71,12 @@ python evaluate_sft_fast_robust.py \
   --output eval_results.json
 ```
 
-### Step 5: Generate Preference Data
+### Step 4: Generate Preference Data
 
 Generate candidate responses from SFT and base models:
 
 ```bash
-python make_prefs.py --phase generate \
+sft-make-prefs --phase generate \
   --sft-model checkpoints/sft/gemma2-9b/checkpoint-final \
   --base-model google/gemma-2-9b \
   --data-path data/processed/train.jsonl \
@@ -95,17 +87,18 @@ python make_prefs.py --phase generate \
 Judge the candidates to create preference pairs:
 
 ```bash
-python make_prefs.py --phase judge \
+sft-make-prefs --phase judge \
   --judge-model Qwen/Qwen2.5-3B-Instruct \
   --data-path data/processed/train.jsonl \
   --max-samples 600 --n-generations 2 \
   --judge-use-8bit --output-mode rich
 ```
 
-### Step 6: Train Reward Model
+### Step 5: Train Reward Model
 
 ```bash
-python train_rm.py -c configs/rm.yaml
+sft-train-rm -c configs/rm.yaml
+# python -m sft.train_rm -c configs/rm.yaml
 ```
 
 Trains a reward model on the preference pairs with anti-gaming penalties.
@@ -195,9 +188,9 @@ The pipeline tracks multiple metrics to assess model performance:
 - **Refusal Rate**: Frequency of insufficient evidence responses
 - **Calibration**: How well confidence scores match actual accuracy
 
-## Google Colab Usage
+## Notebook
 
-The `SFT.ipynb` notebook provides a complete training workflow for Google Colab:
+The `SFT.ipynb` notebook has been updated to use `python -m sft.*` calls so it works after `pip install -e .`.
 
 1. Mount drive and authenticate with Hugging Face
 2. Build the dataset
@@ -207,6 +200,52 @@ The `SFT.ipynb` notebook provides a complete training workflow for Google Colab:
 
 Each step includes progress tracking and intermediate validation.
 
+## Ablations
+
+Run robustness and scaling ablations via the bundled CLI. Use either the console script `sft-ablate` (after `pip install -e .`) or module form.
+
+- Noise robustness:
+  
+  ```bash
+  sft-ablate noise \
+    --test data/processed/test.jsonl \
+    --sft-checkpoint checkpoints/sft/gemma2-9b/checkpoint-60 \
+    --base-model google/gemma-2-9b \
+    --attn-impl eager \
+    --buckets 2048,3072,4096,5120,6144,7168,7936 \
+    --max-new-tokens 256 \
+    --compare-baseline \
+    --outdir ablations/noise
+  # python -m sft.run_ablation_suite noise ...
+  ```
+
+- RM data scaling from preferences (auto 10% val split):
+  
+  ```bash
+  sft-ablate scaling \
+    --prefs prefs/preferences_cb68999425.jsonl \
+    --model microsoft/deberta-v3-base \
+    --epochs 3 --batch-size 8 --grad-accum 2 \
+    --lr 2e-5 --head-lr 1e-4 --warmup-ratio 0.03 \
+    --sizes 128,256,512,768,1024,max \
+    --outdir ablations/scaling/rm
+  ```
+
+- Run both noise and scaling:
+  
+  ```bash
+  sft-ablate all \
+    --test data/processed/test.jsonl \
+    --sft-checkpoint checkpoints/sft/gemma2-9b/checkpoint-60 \
+    --base-model google/gemma-2-9b \
+    --buckets 2048,3072,4096,5120,6144,7168,7936 \
+    --max-new-tokens 256 \
+    --rm-prefs prefs/preferences_cb68999425.jsonl \
+    --outdir ablations
+  ```
+
+Outputs are written under the chosen `--outdir` with per-ablation summaries.
+
 ## Advanced Features
 
 ### Fast Evaluation Mode
@@ -214,7 +253,7 @@ Each step includes progress tracking and intermediate validation.
 Enable bucketed shapes and torch.compile for faster inference:
 
 ```bash
-python evaluate_sft_fast_robust.py \
+sft-eval \
   --fast \
   --buckets 2048,3072,4096,5120,6144,7168 \
   --attn-impl flash2
@@ -225,12 +264,12 @@ python evaluate_sft_fast_robust.py \
 The pipeline supports distributed training via Hugging Face Accelerate:
 
 ```bash
-accelerate launch train_sft.py -c configs/sft_gemma2.yaml
+accelerate launch python -m sft.train_sft -c configs/sft_gemma2.yaml
 ```
 
 ### Custom Templates
 
-Modify prompt templates in `prompt_schema.py`:
+Modify prompt templates in `src/sft/prompt_schema.py`:
 - `SFT_TEMPLATE`: Default training template
 - `SFT_STRUCTURED_TEMPLATE`: More structured format
 - `SFT_FEWSHOT_TEMPLATE`: Few-shot examples included

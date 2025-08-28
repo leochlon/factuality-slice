@@ -41,7 +41,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # ---- Optional OutputValidator (graceful fallback) ----
 _HAS_VALIDATOR = False
 try:
-    from prompt_schema import OutputValidator  # real validator if present
+    from sft.prompt_schema import OutputValidator  # real validator if present
     _HAS_VALIDATOR = True
 except Exception:
     class _Parsed:
@@ -537,7 +537,7 @@ def main():
     data = read_jsonl(data_path)
     if not data: raise SystemExit(f"No data found at {args.data_path}")
 
-    from prompt_schema import PromptTemplates
+    from sft.prompt_schema import PromptTemplates
     pt = PromptTemplates()
 
     prompts: List[Tuple[int, str]] = []
